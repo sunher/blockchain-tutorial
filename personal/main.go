@@ -9,22 +9,22 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/gorilla/mux"
 	"io"
 	"log"
 	mrand "math/rand"
-	"os"
+	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	golog "github.com/ipfs/go-log"
-	libp2p "github.com/libp2p/go-libp2p"
-	crypto "github.com/libp2p/go-libp2p-crypto"
-	host "github.com/libp2p/go-libp2p-host"
-	net "github.com/libp2p/go-libp2p-net"
-	peer "github.com/libp2p/go-libp2p-peer"
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-crypto"
+	"github.com/libp2p/go-libp2p-host"
+	"github.com/libp2p/go-libp2p-net"
+	"github.com/libp2p/go-libp2p-peer"
 	pstore "github.com/libp2p/go-libp2p-peerstore"
 	ma "github.com/multiformats/go-multiaddr"
 	gologging "github.com/whyrusleeping/go-logging"
@@ -41,6 +41,7 @@ type Block struct {
 
 // Blockchain is a series of validated Blocks
 var Blockchain []Block
+var Address []string
 
 var mutex = &sync.Mutex{}
 
@@ -160,45 +161,46 @@ func writeData(rw *bufio.ReadWriter) {
 		}
 	}()
 
-	stdReader := bufio.NewReader(os.Stdin)
+	//stdReader := bufio.NewReader(os.Stdin)
+	//
+	//for {
+	//fmt.Print("> ")
+	//sendData, err := stdReader.ReadString('\n')
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+	//
+	//sendData = strings.Replace(sendData, "\n", "", -1)
+	//bpm, err := strconv.Atoi(sendData)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+	//newBlock := generateBlock(Blockchain[len(Blockchain)-1], bpm)
 
-	for {
-		fmt.Print("> ")
-		sendData, err := stdReader.ReadString('\n')
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		sendData = strings.Replace(sendData, "\n", "", -1)
-		bpm, err := strconv.Atoi(sendData)
-		if err != nil {
-			log.Fatal(err)
-		}
-		newBlock := generateBlock(Blockchain[len(Blockchain)-1], bpm)
-
-		if isBlockValid(newBlock, Blockchain[len(Blockchain)-1]) {
-			mutex.Lock()
-			Blockchain = append(Blockchain, newBlock)
-			mutex.Unlock()
-		}
-
-		bytes, err := json.Marshal(Blockchain)
-		if err != nil {
-			log.Println(err)
-		}
-
-		spew.Dump(Blockchain)
-
-		mutex.Lock()
-		rw.WriteString(fmt.Sprintf("%s\n", string(bytes)))
-		rw.Flush()
-		mutex.Unlock()
-	}
+	//if isBlockValid(newBlock, Blockchain[len(Blockchain)-1]) {
+	//	mutex.Lock()
+	//	Blockchain = append(Blockchain, newBlock)
+	//	mutex.Unlock()
+	//}
+	//
+	//bytes, err := json.Marshal(Blockchain)
+	//if err != nil {
+	//	log.Println(err)
+	//}
+	//
+	//spew.Dump(Blockchain)
+	//
+	//mutex.Lock()
+	//rw.WriteString(fmt.Sprintf("%s\n", string(bytes)))
+	//rw.Flush()
+	//mutex.Unlock()
+	//}
 
 }
 
 func main() {
 	t := time.Now()
+	go run()
 	genesisBlock := Block{}
 	genesisBlock = Block{0, t.String(), 0, calculateHash(genesisBlock), ""}
 
@@ -282,6 +284,116 @@ func main() {
 		select {} // hang forever
 
 	}
+}
+
+// web server
+func run() error {
+	mux := makeMuxRouter()
+	httpPort := "8080"
+	log.Println("HTTP Server Listening on port :", httpPort)
+	s := &http.Server{
+		Addr:           ":" + httpPort,
+		Handler:        mux,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 20,
+	}
+
+	if err := s.ListenAndServe(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// create handlers
+func makeMuxRouter() http.Handler {
+	muxRouter := mux.NewRouter()
+	muxRouter.HandleFunc("/getBlockchain", handleGetBlockchain).Methods("GET")
+	muxRouter.HandleFunc("/blockchain", handleWriteBlock).Methods("POST")
+	muxRouter.HandleFunc("/address", handleAddress).Methods("POST")
+	muxRouter.HandleFunc("/address", getAddress).Methods("GET")
+	return muxRouter
+}
+
+type P2PAddr struct {
+	Address string
+}
+
+func getAddress(w http.ResponseWriter, r *http.Request) {
+	bytes, err := json.MarshalIndent(Address, "", "  ")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	io.WriteString(w, string(bytes))
+
+}
+
+func handleAddress(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var msg P2PAddr
+
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&msg); err != nil {
+		respondWithJSON(w, r, http.StatusBadRequest, r.Body)
+		return
+	}
+	defer r.Body.Close()
+	Address = append(Address, msg.Address)
+	mutex.Lock()
+
+}
+
+// write blockchain when we receive an http request
+func handleGetBlockchain(w http.ResponseWriter, r *http.Request) {
+	bytes, err := json.MarshalIndent(Blockchain, "", "  ")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	io.WriteString(w, string(bytes))
+}
+
+type Message struct {
+	BPM int
+}
+
+// takes JSON payload as an input for heart rate (BPM)
+func handleWriteBlock(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var msg Message
+
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&msg); err != nil {
+		respondWithJSON(w, r, http.StatusBadRequest, r.Body)
+		return
+	}
+	defer r.Body.Close()
+
+	prevBlock := Blockchain[len(Blockchain)-1]
+	mutex.Lock()
+	newBlock := generateBlock(prevBlock, msg.BPM)
+	mutex.Unlock()
+
+	if isBlockValid(newBlock, prevBlock) {
+		Blockchain = append(Blockchain, newBlock)
+		spew.Dump(Blockchain)
+	}
+
+	respondWithJSON(w, r, http.StatusCreated, newBlock)
+
+}
+
+func respondWithJSON(w http.ResponseWriter, r *http.Request, code int, payload interface{}) {
+	response, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("HTTP 500: Internal Server Error"))
+		return
+	}
+	w.WriteHeader(code)
+	w.Write(response)
 }
 
 // make sure block is valid by checking index, and comparing the hash of the previous block
